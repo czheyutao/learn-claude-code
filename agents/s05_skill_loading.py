@@ -1,38 +1,41 @@
 #!/usr/bin/env python3
 # Harness: on-demand knowledge -- domain expertise, loaded when the model asks.
 """
-s05_skill_loading.py - Skills
+s05_skill_loading.py - 技能加载（按需注入专业知识）
 
-Two-layer skill injection that avoids bloating the system prompt:
+两层式技能注入，避免系统提示词过度膨胀：
 
-    Layer 1 (cheap): skill names in system prompt (~100 tokens/skill)
-    Layer 2 (on demand): full skill body in tool_result
+    Layer 1（廉价）：技能名称列表放在系统提示词中（约 100 tokens/技能）
+    Layer 2（按需）：完整的技能正文通过 tool_result 返回
 
     skills/
       pdf/
-        SKILL.md          <-- frontmatter (name, description) + body
+        SKILL.md          <-- frontmatter（name, description）+ 正文
       code-review/
         SKILL.md
 
-    System prompt:
+    系统提示词：
     +--------------------------------------+
-    | You are a coding agent.              |
-    | Skills available:                    |
-    |   - pdf: Process PDF files...        |  <-- Layer 1: metadata only
-    |   - code-review: Review code...      |
+    | 你是一个编程助手。                      |
+    | 可用的技能：                            |
+    |   - pdf: 处理 PDF 文件...              |  <-- Layer 1: 仅元数据
+    |   - code-review: 代码审查...          |
     +--------------------------------------+
 
-    When model calls load_skill("pdf"):
+    当模型调用 load_skill("pdf") 时：
     +--------------------------------------+
     | tool_result:                         |
     | <skill>                              |
-    |   Full PDF processing instructions   |  <-- Layer 2: full body
-    |   Step 1: ...                        |
-    |   Step 2: ...                        |
+    |   完整的 PDF 处理指南...               |  <-- Layer 2: 完整正文
+    |   步骤 1: ...                        |
     | </skill>                             |
     +--------------------------------------+
 
-Key insight: "Don't put everything in the system prompt. Load on demand."
+执行示例：
+    python agents/s05_skill_loading.py
+
+核心理念: "Don't put everything in the system prompt. Load on demand."
+          （不要把所有的领域知识都塞进系统提示词，按需加载即可。）
 """
 
 import os
@@ -55,14 +58,30 @@ MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / "skills"
 
 
-# -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
+# -- SkillLoader: 扫描 skills/<name>/SKILL.md 文件，解析 YAML frontmatter --
 class SkillLoader:
+    """
+    技能加载器。
+
+    在初始化时递归扫描 skills 目录下的所有 SKILL.md 文件，
+    解析 YAML frontmatter 获取技能名称（name）、描述（description）、标签（tags），
+    并将正文部分缓存起来供按需加载。
+
+    两层设计：
+        get_descriptions() → Layer 1：放入系统提示词，仅含名称和描述
+        get_content(name)  → Layer 2：通过 load_skill 工具按需返回完整正文
+    """
+
     def __init__(self, skills_dir: Path):
         self.skills_dir = skills_dir
         self.skills = {}
         self._load_all()
 
     def _load_all(self):
+        """
+        递归扫描 skills 目录下的所有 SKILL.md 文件并解析。
+        使用目录名作为默认的技能标识符。
+        """
         if not self.skills_dir.exists():
             return
         for f in sorted(self.skills_dir.rglob("SKILL.md")):
@@ -72,7 +91,17 @@ class SkillLoader:
             self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
 
     def _parse_frontmatter(self, text: str) -> tuple:
-        """Parse YAML frontmatter between --- delimiters."""
+        """
+        解析 YAML frontmatter。
+
+        SKILL.md 文件以 --- 分隔符包裹 YAML 元数据，格式如下：
+            ---
+            name: pdf
+            description: 处理 PDF 文件的指南
+            tags: document, pdf
+            ---
+            技能正文从这里开始...
+        """
         match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
         if not match:
             return {}, text
@@ -83,7 +112,7 @@ class SkillLoader:
         return meta, match.group(2).strip()
 
     def get_descriptions(self) -> str:
-        """Layer 1: short descriptions for the system prompt."""
+        """Layer 1：生成技能描述列表，嵌入到系统提示词中（廉价）。"""
         if not self.skills:
             return "(no skills available)"
         lines = []
@@ -97,7 +126,7 @@ class SkillLoader:
         return "\n".join(lines)
 
     def get_content(self, name: str) -> str:
-        """Layer 2: full skill body returned in tool_result."""
+        """Layer 2：根据技能名称返回完整的技能正文（按需、昂贵）。"""
         skill = self.skills.get(name)
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
@@ -106,7 +135,7 @@ class SkillLoader:
 
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
-# Layer 1: skill metadata injected into system prompt
+# Layer 1：将技能描述信息注入系统提示词
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 
@@ -114,14 +143,17 @@ Skills available:
 {SKILL_LOADER.get_descriptions()}"""
 
 
-# -- Tool implementations --
+# -- 工具实现函数（与 s04 一致，新增 load_skill） --
 def safe_path(p: str) -> Path:
+    """路径安全检查：将相对路径解析为工作目录下的绝对路径，防止路径逃逸。"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+
 def run_bash(command: str) -> str:
+    """执行 shell 命令并返回输出，含基本的危险命令黑名单和 120 秒超时保护。"""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -133,7 +165,9 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+
 def run_read(path: str, limit: int = None) -> str:
+    """读取文件内容，支持 limit 限制行数，结果截断至 50000 字符。"""
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -142,7 +176,9 @@ def run_read(path: str, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_write(path: str, content: str) -> str:
+    """将内容写入指定文件，父目录不存在时自动创建。"""
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -151,7 +187,9 @@ def run_write(path: str, content: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """在文件中精确替换文本（仅替换首次出现的位置）。"""
     try:
         fp = safe_path(path)
         content = fp.read_text()
@@ -163,6 +201,10 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# -- 工具分发映射 --
+# 与 s04 的区别：去掉了 task 工具（子代理），新增了 load_skill 工具（技能加载）。
+# 这意味着 s05 的 Agent 专注于"自己完成任务 + 按需加载领域知识"，
+# 不再具备创建子代理的能力。
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -185,6 +227,10 @@ TOOLS = [
 ]
 
 
+# -- Agent 循环 --
+# 与 s04 相比没有任何结构变化。唯一的区别是 TOOLS 中包含 load_skill，
+# 因此模型可以在需要领域知识时通过查表调用 skill 加载器。
+# 核心循环依然是：调用模型 → 执行工具 → 追加结果 → 重复。
 def agent_loop(messages: list):
     while True:
         response = client.messages.create(
@@ -209,6 +255,16 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    """
+    交互式 REPL 入口。
+
+    提供 s05 >> 提示符，支持 q / exit / 空输入 退出。
+    与 s04 的区别：模型现在可以加载技能知识来指导自己的工作。
+    建议尝试以下输入：
+        "What skills are available?"
+        "Load the agent-builder skill"
+        "I need to do a code review"
+    """
     history = []
     while True:
         try:

@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # Harness: context isolation -- protecting the model's clarity of thought.
 """
-s04_subagent.py - Subagents
+s04_subagent.py - 子代理（上下文隔离）
 
-Spawn a child agent with fresh messages=[]. The child works in its own
-context, sharing the filesystem, then returns only a summary to the parent.
+父代理通过 task 工具派生子代理。子代理以全新的 messages=[]
+（空白上下文）启动，与父代理共享文件系统但互不看到对方的对话历史。
+完成后仅将最终文本摘要返回给父代理，子代理的全部中间对话随进程销毁。
+
+执行示例：
+    python agents/s04_subagent.py
+
+架构示意：
 
     Parent agent                     Subagent
     +------------------+             +------------------+
@@ -20,7 +26,8 @@ context, sharing the filesystem, then returns only a summary to the parent.
     Parent context stays clean.
     Subagent context is discarded.
 
-Key insight: "Process isolation gives context isolation for free."
+核心理念: "Process isolation gives context isolation for free."
+          （进程隔离天然带来了上下文隔离，完全免费。）
 """
 
 import os
@@ -39,11 +46,13 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
+# 父代理的系统提示词：可以使用 task 工具派生子代理处理探索或子任务
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+# 子代理的系统提示词：完成任务后必须做总结，因为只有最终文本会返回给父代理
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
 
-# -- Tool implementations shared by parent and child --
+# -- 工具实现函数（safe_path + 4 个基础工具，父代理和子代理共享） --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -94,6 +103,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# 基础工具分发映射：bash + 4 个文件工具（父代理和子代理共用）
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -101,7 +111,8 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
-# Child gets all base tools except task (no recursive spawning)
+# 子代理工具集：只有基础工具，没有 task。
+# 这防止子代理再派生子代理（防止无限递归），也限制子代理只能做文件操作。
 CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -114,10 +125,16 @@ CHILD_TOOLS = [
 ]
 
 
-# -- Subagent: fresh context, filtered tools, summary-only return --
+# -- 子代理执行：全新上下文 + 受限工具 + 仅返回摘要 --
+# 这是 s04 的核心机制。子代理拥有：
+#   1. 全新的 messages=[] — 看不到父代理的对话历史
+#   2. 受限的工具集（CHILD_TOOLS，无 task）— 不能递归创建子代理
+#   3. 30 轮安全上限 — 防止死循环耗尽 API 额度
+#   4. 最终只有文本摘要返回 — 中间所有工具调用结果全部丢弃
 def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
-    for _ in range(30):  # safety limit
+    sub_messages = [{"role": "user", "content": prompt}]  # 全新上下文，只能看到这一个 prompt
+    for _ in range(30):  # 最多 30 轮，安全兜底
+        # 子代理内部循环：使用 SUBAGENT_SYSTEM + CHILD_TOOLS
         response = client.messages.create(
             model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
             tools=CHILD_TOOLS, max_tokens=8000,
@@ -132,11 +149,13 @@ def run_subagent(prompt: str) -> str:
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
         sub_messages.append({"role": "user", "content": results})
-    # Only the final text returns to the parent -- child context is discarded
+    # 只返回最终文本，子代理的 sub_messages 在此函数返回后即被 GC 回收
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
 
-# -- Parent tools: base tools + task dispatcher --
+# -- 父代理工具集：基础工具 + task 调度器 --
+# 父代理拥有子代理的所有工具，外加 task 工具用于派生子代理。
+# task 工具不在 TOOL_HANDLERS 中注册，而是在 agent_loop 中做特殊分支处理。
 PARENT_TOOLS = CHILD_TOOLS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
@@ -144,6 +163,15 @@ PARENT_TOOLS = CHILD_TOOLS + [
 
 
 def agent_loop(messages: list):
+    """
+    父代理的核心循环。
+
+    与之前版本的关键区别：
+    1. 使用 PARENT_TOOLS（含 task 工具）
+    2. 对 task 工具做特殊分支处理——不走 TOOL_HANDLERS 查表，
+       而是直接调用 run_subagent() 启动子代理
+    3. 子代理执行期间父代理阻塞等待，直到子代理返回摘要文本
+    """
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -155,12 +183,14 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                # task 工具做特殊处理：启动子代理
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
                     prompt = block.input.get("prompt", "")
                     print(f"> task ({desc}): {prompt[:80]}")
-                    output = run_subagent(prompt)
+                    output = run_subagent(prompt)  # 父代理在此阻塞，等待子代理完成
                 else:
+                    # 其他工具走正常的 TOOL_HANDLERS 查表分发
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 print(f"  {str(output)[:200]}")
@@ -169,6 +199,13 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    """
+    交互式 REPL 入口。
+
+    提供 s04 >> 提示符，支持 q / exit / 空输入 退出。
+    与之前版本的区别：模型可以使用 task 工具派生子代理来执行
+    探索性任务或子任务，子代理的上下文在完成后会被丢弃。
+    """
     history = []
     while True:
         try:
@@ -179,6 +216,7 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
+        # 打印模型最终的文本回复
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
