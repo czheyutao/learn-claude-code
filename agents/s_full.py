@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 # Harness: all mechanisms combined -- the complete cockpit for the model.
 """
-s_full.py - Full Reference Agent
+s_full.py - 完整参考实现
 
-Capstone implementation combining every mechanism from s01-s11.
-Session s12 (task-aware worktree isolation) is taught separately.
-NOT a teaching session -- this is the "put it all together" reference.
+将所有 s01-s11 的机制整合到一个文件中（s12 的 worktree 隔离单独教学）。
+这不是教学单元——这是"全部整合"的参考实现。
 
     +------------------------------------------------------------------+
-    |                        FULL AGENT                                 |
+    |                        完整 Agent                                 |
     |                                                                   |
-    |  System prompt (s05 skills, task-first + optional todo nag)      |
+    |  System prompt（含 s05 技能列表，task-first + 可选的 todo 提醒）     |
     |                                                                   |
-    |  Before each LLM call:                                            |
+    |  每次 LLM 调用前：                                                  |
     |  +--------------------+  +------------------+  +--------------+  |
     |  | Microcompact (s06) |  | Drain bg (s08)   |  | Check inbox  |  |
-    |  | Auto-compact (s06) |  | notifications    |  | (s09)        |  |
+    |  | Auto-compact (s06) |  | 后台通知排空       |  | 收件箱 (s09)  |  |
     |  +--------------------+  +------------------+  +--------------+  |
     |                                                                   |
-    |  Tool dispatch (s02 pattern):                                     |
+    |  工具分发（s02 模式）：                                             |
     |  +--------+----------+----------+---------+-----------+          |
     |  | bash   | read     | write    | edit    | TodoWrite |          |
     |  | task   | load_sk  | compress | bg_run  | bg_check  |          |
@@ -29,11 +28,14 @@ NOT a teaching session -- this is the "put it all together" reference.
     |                                                                   |
     |  Subagent (s04):  spawn -> work -> return summary                 |
     |  Teammate (s09):  spawn -> work -> idle -> auto-claim (s11)      |
-    |  Shutdown (s10):  request_id handshake                            |
+    |  Shutdown (s10):  request_id 握手                                  |
     |  Plan gate (s10): submit -> approve/reject                        |
     +------------------------------------------------------------------+
 
-    REPL commands: /compact /tasks /team /inbox
+    REPL 命令: /compact /tasks /team /inbox
+
+执行示例：
+    python agents/s_full.py
 """
 
 import json
@@ -70,7 +72,7 @@ VALID_MSG_TYPES = {"message", "broadcast", "shutdown_request",
                    "shutdown_response", "plan_approval_response"}
 
 
-# === SECTION: base_tools ===
+# === 基础工具 (s01/s02) ===
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -119,12 +121,15 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-# === SECTION: todos (s03) ===
+# === Todo 管理器 (s03) ===
 class TodoManager:
+    """内存中的 Todo 列表，含 nag reminder 机制。"""
+
     def __init__(self):
         self.items = []
 
     def update(self, items: list) -> str:
+        """更新 Todo 列表，校验：最多 20 条、只能有一个 in_progress。"""
         validated, ip = [], 0
         for i, item in enumerate(items):
             content = str(item.get("content", "")).strip()
@@ -153,11 +158,13 @@ class TodoManager:
         return "\n".join(lines)
 
     def has_open_items(self) -> bool:
+        """是否有未完成的任务——用于 nag reminder 决策。"""
         return any(item.get("status") != "completed" for item in self.items)
 
 
-# === SECTION: subagent (s04) ===
+# === Subagent (s04) ===
 def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
+    """生成一个子代理，独立 message 列表，最多 30 轮。"""
     sub_tools = [
         {"name": "bash", "description": "Run command.",
          "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -195,8 +202,10 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
     return "(subagent failed)"
 
 
-# === SECTION: skills (s05) ===
+# === 技能管理器 (s05) ===
 class SkillLoader:
+    """从 skills/ 目录加载 SKILL.md，frontmatter 解析。"""
+
     def __init__(self, skills_dir: Path):
         self.skills = {}
         if skills_dir.exists():
@@ -223,11 +232,12 @@ class SkillLoader:
         return f"<skill name=\"{name}\">\n{s['body']}\n</skill>"
 
 
-# === SECTION: compression (s06) ===
+# === 上下文压缩 (s06) ===
 def estimate_tokens(messages: list) -> int:
     return len(json.dumps(messages, default=str)) // 4
 
 def microcompact(messages: list):
+    """第1层压缩：替换旧 tool_result 为占位符。"""
     indices = []
     for i, msg in enumerate(messages):
         if msg["role"] == "user" and isinstance(msg.get("content"), list):
@@ -241,6 +251,7 @@ def microcompact(messages: list):
             part["content"] = "[cleared]"
 
 def auto_compact(messages: list) -> list:
+    """第2/3层压缩：保存完整转录，生成摘要，替换全部消息。"""
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with open(path, "w") as f:
@@ -258,8 +269,10 @@ def auto_compact(messages: list) -> list:
     ]
 
 
-# === SECTION: file_tasks (s07) ===
+# === 持久化任务 (s07) ===
 class TaskManager:
+    """文件持久化任务管理，支持依赖图。"""
+
     def __init__(self):
         TASKS_DIR.mkdir(exist_ok=True)
 
@@ -289,12 +302,14 @@ class TaskManager:
         task = self._load(tid)
         if status:
             task["status"] = status
+            # 完成时级联清理依赖
             if status == "completed":
                 for f in TASKS_DIR.glob("task_*.json"):
                     t = json.loads(f.read_text())
                     if tid in t.get("blockedBy", []):
                         t["blockedBy"].remove(tid)
                         self._save(t)
+            # 支持软删除
             if status == "deleted":
                 (TASKS_DIR / f"task_{tid}.json").unlink(missing_ok=True)
                 return f"Task {tid} deleted"
@@ -317,6 +332,7 @@ class TaskManager:
         return "\n".join(lines)
 
     def claim(self, tid: int, owner: str) -> str:
+        """认领任务并自动标记为 in_progress。"""
         task = self._load(tid)
         task["owner"] = owner
         task["status"] = "in_progress"
@@ -324,8 +340,10 @@ class TaskManager:
         return f"Claimed task #{tid} for {owner}"
 
 
-# === SECTION: background (s08) ===
+# === 后台任务 (s08) ===
 class BackgroundManager:
+    """后台线程执行管理器，通过 Queue 通知主循环。"""
+
     def __init__(self):
         self.tasks = {}
         self.notifications = Queue()
@@ -354,14 +372,17 @@ class BackgroundManager:
         return "\n".join(f"{k}: [{v['status']}] {v['command'][:60]}" for k, v in self.tasks.items()) or "No bg tasks."
 
     def drain(self) -> list:
+        """排空所有后台通知。"""
         notifs = []
         while not self.notifications.empty():
             notifs.append(self.notifications.get_nowait())
         return notifs
 
 
-# === SECTION: messaging (s09) ===
+# === 消息总线 (s09) ===
 class MessageBus:
+    """JSONL 文件收件箱，支持 drain 模式读写。"""
+
     def __init__(self):
         INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -390,13 +411,18 @@ class MessageBus:
         return f"Broadcast to {count} teammates"
 
 
-# === SECTION: shutdown + plan tracking (s10) ===
-shutdown_requests = {}
-plan_requests = {}
+# === 协议追踪器 (s10) ===
+shutdown_requests = {}  # {request_id: {target, status}}
+plan_requests = {}       # {request_id: {from, plan, status}}
 
 
-# === SECTION: team (s09/s11) ===
+# === 团队 + 自主性 (s09/s10/s11) ===
 class TeammateManager:
+    """
+    队员管理器（整合 s09 spawn、s10 协议、s11 自主性）。
+    状态机：working → idle → (auto-claim / inbox message) → working → ... → shutdown
+    """
+
     def __init__(self, bus: MessageBus, task_mgr: TaskManager):
         TEAM_DIR.mkdir(exist_ok=True)
         self.bus = bus
@@ -439,6 +465,7 @@ class TeammateManager:
             self._save()
 
     def _loop(self, name: str, role: str, prompt: str):
+        """队员主循环：WORK PHASE → IDLE PHASE → WORK PHASE → ..."""
         team_name = self.config["team_name"]
         sys_prompt = (f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
                       f"Use idle when done with current work. You may auto-claim tasks.")
@@ -453,7 +480,7 @@ class TeammateManager:
             {"name": "claim_task", "description": "Claim task by ID.", "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
         ]
         while True:
-            # -- WORK PHASE --
+            # -- 工作阶段 --
             for _ in range(50):
                 inbox = self.bus.read_inbox(name)
                 for msg in inbox:
@@ -493,7 +520,7 @@ class TeammateManager:
                 messages.append({"role": "user", "content": results})
                 if idle_requested:
                     break
-            # -- IDLE PHASE: poll for messages and unclaimed tasks --
+            # -- 空闲阶段：轮询消息和未领取任务 --
             self._set_status(name, "idle")
             resume = False
             for _ in range(IDLE_TIMEOUT // max(POLL_INTERVAL, 1)):
@@ -507,6 +534,7 @@ class TeammateManager:
                         messages.append({"role": "user", "content": json.dumps(msg)})
                     resume = True
                     break
+                # 扫描未领取任务
                 unclaimed = []
                 for f in sorted(TASKS_DIR.glob("task_*.json")):
                     t = json.loads(f.read_text())
@@ -515,7 +543,7 @@ class TeammateManager:
                 if unclaimed:
                     task = unclaimed[0]
                     self.task_mgr.claim(task["id"], name)
-                    # Identity re-injection for compressed contexts
+                    # 身份重注入（应对上下文压缩）
                     if len(messages) <= 3:
                         messages.insert(0, {"role": "user", "content":
                             f"<identity>You are '{name}', role: {role}, team: {team_name}.</identity>"})
@@ -541,7 +569,7 @@ class TeammateManager:
         return [m["name"] for m in self.config["members"]]
 
 
-# === SECTION: global_instances ===
+# === 全局实例 ===
 TODO = TodoManager()
 SKILLS = SkillLoader(SKILLS_DIR)
 TASK_MGR = TaskManager()
@@ -549,21 +577,21 @@ BG = BackgroundManager()
 BUS = MessageBus()
 TEAM = TeammateManager(BUS, TASK_MGR)
 
-# === SECTION: system_prompt ===
+# === 系统提示词（整合 s05 技能列表） ===
 SYSTEM = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
 Prefer task_create/task_update/task_list for multi-step work. Use TodoWrite for short checklists.
 Use task for subagent delegation. Use load_skill for specialized knowledge.
 Skills: {SKILLS.descriptions()}"""
 
 
-# === SECTION: shutdown_protocol (s10) ===
+# === 关闭协议 (s10) ===
 def handle_shutdown_request(teammate: str) -> str:
     req_id = str(uuid.uuid4())[:8]
     shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
     BUS.send("lead", teammate, "Please shut down.", "shutdown_request", {"request_id": req_id})
     return f"Shutdown request {req_id} sent to '{teammate}'"
 
-# === SECTION: plan_approval (s10) ===
+# === 计划审批 (s10) ===
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
     req = plan_requests.get(request_id)
     if not req: return f"Error: Unknown plan request_id '{request_id}'"
@@ -573,7 +601,7 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
     return f"Plan {req['status']} for '{req['from']}'"
 
 
-# === SECTION: tool_dispatch (s02) ===
+# === 工具分发 (s02) — 整合全部 21 个工具 ===
 TOOL_HANDLERS = {
     "bash":             lambda **kw: run_bash(kw["command"]),
     "read_file":        lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -650,25 +678,32 @@ TOOLS = [
 ]
 
 
-# === SECTION: agent_loop ===
+# === Agent 主循环（整合全部机制） ===
 def agent_loop(messages: list):
+    """
+    完整 Agent Loop，整合 s03-s11 的所有机制：
+    - s03: nag reminder（TodoWrite 3 轮不更新则提醒）
+    - s06: 压缩管线（microcompact + auto_compact + manual compress）
+    - s08: 后台通知排空
+    - s09/s10: 收件箱检查
+    """
     rounds_without_todo = 0
     while True:
-        # s06: compression pipeline
+        # s06: 压缩管线 - microcompact + auto_compact
         microcompact(messages)
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
             print("[auto-compact triggered]")
             messages[:] = auto_compact(messages)
-        # s08: drain background notifications
+        # s08: 排空后台通知
         notifs = BG.drain()
         if notifs:
             txt = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
             messages.append({"role": "user", "content": f"<background-results>\n{txt}\n</background-results>"})
-        # s10: check lead inbox
+        # s10: 检查 lead 收件箱
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({"role": "user", "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"})
-        # LLM call
+        # LLM 调用
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
@@ -676,7 +711,7 @@ def agent_loop(messages: list):
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
-        # Tool execution
+        # 工具执行
         results = []
         used_todo = False
         manual_compress = False
@@ -694,20 +729,24 @@ def agent_loop(messages: list):
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "TodoWrite":
                     used_todo = True
-        # s03: nag reminder (only when todo workflow is active)
+        # s03: nag reminder（仅在有活跃 todo 流程时生效）
         rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
         if TODO.has_open_items() and rounds_without_todo >= 3:
             results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         messages.append({"role": "user", "content": results})
-        # s06: manual compress
+        # s06: 手动压缩（compress 工具触发）
         if manual_compress:
             print("[manual compact]")
             messages[:] = auto_compact(messages)
             return
 
 
-# === SECTION: repl ===
+# === REPL 入口 ===
 if __name__ == "__main__":
+    """
+    交互式 REPL。
+    支持命令：/compact /tasks /team /inbox
+    """
     history = []
     while True:
         try:

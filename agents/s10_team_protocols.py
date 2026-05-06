@@ -1,50 +1,57 @@
 #!/usr/bin/env python3
 # Harness: protocols -- structured handshakes between models.
 """
-s10_team_protocols.py - Team Protocols
+s10_team_protocols.py - 团队协议（模型间结构化握手）
 
-Shutdown protocol and plan approval protocol, both using the same
-request_id correlation pattern. Builds on s09's team messaging.
+基于 s09 的消息邮箱，新增两个结构化协议：
+1. 关闭协议（Shutdown Protocol）：Lead 请求队员关闭，队员回应批准/拒绝
+2. 计划审批协议（Plan Approval Protocol）：队员提交计划，Lead 审批
 
-    Shutdown FSM: pending -> approved | rejected
+两者使用相同的 request_id 关联模式来匹配请求和响应。
 
-    Lead                              Teammate
-    +---------------------+          +---------------------+
-    | shutdown_request     |          |                     |
-    | {                    | -------> | receives request    |
-    |   request_id: abc    |          | decides: approve?   |
-    | }                    |          |                     |
-    +---------------------+          +---------------------+
-                                             |
-    +---------------------+          +-------v-------------+
-    | shutdown_response    | <------- | shutdown_response   |
-    | {                    |          | {                   |
-    |   request_id: abc    |          |   request_id: abc   |
-    |   approve: true      |          |   approve: true     |
-    | }                    |          | }                   |
-    +---------------------+          +---------------------+
+    关闭协议状态机：pending -> approved | rejected
+
+    Lead（队长）                        Teammate（队员）
+    +---------------------+            +---------------------+
+    | shutdown_request     |            |                     |
+    | {                    | -------->  | 收到请求            |
+    |   request_id: abc    |            | 决定：批准或拒绝？   |
+    | }                    |            |                     |
+    +---------------------+            +---------------------+
+                                               |
+    +---------------------+            +-------v-------------+
+    | shutdown_response    | <-------- | shutdown_response   |
+    | {                    |            | {                   |
+    |   request_id: abc    |            |   request_id: abc   |
+    |   approve: true      |            |   approve: true     |
+    | }                    |            | }                   |
+    +---------------------+            +---------------------+
             |
             v
-    status -> "shutdown", thread stops
+    status -> "shutdown"，线程停止
 
-    Plan approval FSM: pending -> approved | rejected
+    计划审批状态机：pending -> approved | rejected
 
-    Teammate                          Lead
-    +---------------------+          +---------------------+
-    | plan_approval        |          |                     |
-    | submit: {plan:"..."}| -------> | reviews plan text   |
-    +---------------------+          | approve/reject?     |
-                                     +---------------------+
-                                             |
-    +---------------------+          +-------v-------------+
-    | plan_approval_resp   | <------- | plan_approval       |
-    | {approve: true}      |          | review: {req_id,    |
-    +---------------------+          |   approve: true}     |
-                                     +---------------------+
+    Teammate（队员）                   Lead（队长）
+    +---------------------+            +---------------------+
+    | plan_approval        |            |                     |
+    | submit: {plan:"..."}| -------->  | 审查计划文本         |
+    +---------------------+            | 批准/拒绝？          |
+                                       +---------------------+
+                                               |
+    +---------------------+            +-------v-------------+
+    | plan_approval_resp   | <-------- | plan_approval        |
+    | {approve: true}      |            | review: {req_id,    |
+    +---------------------+            |   approve: true}     |
+                                       +---------------------+
 
-    Trackers: {request_id: {"target|from": name, "status": "pending|..."}}
+    Tracker：{request_id: {"target|from": name, "status": "pending|..."}}
 
-Key insight: "Same request_id correlation pattern, two domains."
+核心理念: "Same request_id correlation pattern, two domains."
+          （同一个 request_id 关联模式，应用于两个场景。）
+
+执行示例：
+    python agents/s10_team_protocols.py
 """
 
 import json
@@ -78,13 +85,13 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 
-# -- Request trackers: correlate by request_id --
-shutdown_requests = {}
-plan_requests = {}
-_tracker_lock = threading.Lock()
+# -- 请求追踪器：通过 request_id 关联请求和响应 --
+shutdown_requests = {}  # {request_id: {target, status}}
+plan_requests = {}       # {request_id: {from, plan, status}}
+_tracker_lock = threading.Lock()  # 保护上述两个字典的线程安全锁
 
 
-# -- MessageBus: JSONL inbox per teammate --
+# -- MessageBus: JSONL 收件箱（同 s09） --
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
@@ -130,7 +137,7 @@ class MessageBus:
 BUS = MessageBus(INBOX_DIR)
 
 
-# -- TeammateManager with shutdown + plan approval --
+# -- TeammateManager: 新增 shutdown_response 和 plan_approval 工具 --
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -174,6 +181,12 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
 
     def _teammate_loop(self, name: str, role: str, prompt: str):
+        """
+        队员的 Agent Loop（s10 增强版）。
+        支持两个新工具：
+        - shutdown_response：收到 shutdown_request 后决定是否同意关闭
+        - plan_approval：在执行重大操作前向 Lead 提交计划等待审批
+        """
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Submit plans via plan_approval before major work. "
@@ -211,16 +224,23 @@ class TeammateManager:
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+                    # 如果队员批准了 shutdown，标记退出
                     if block.name == "shutdown_response" and block.input.get("approve"):
                         should_exit = True
             messages.append({"role": "user", "content": results})
+        # 循环结束后更新状态
         member = self._find_member(name)
         if member:
             member["status"] = "shutdown" if should_exit else "idle"
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
-        # these base tools are unchanged from s02
+        """
+        队员工具执行分发（s10 增强版）。
+        新增：
+        - shutdown_response：发送响应并更新追踪器
+        - plan_approval：提交计划到 Lead 并等待审批
+        """
         if tool_name == "bash":
             return _run_bash(args["command"])
         if tool_name == "read_file":
@@ -257,7 +277,7 @@ class TeammateManager:
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
-        # these base tools are unchanged from s02
+        """队员工具集（s10 增强版）：新增 shutdown_response 和 plan_approval。"""
         return [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -292,7 +312,7 @@ class TeammateManager:
 TEAM = TeammateManager(TEAM_DIR)
 
 
-# -- Base tool implementations (these base tools are unchanged from s02) --
+# -- 基础工具实现 --
 def _safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -347,8 +367,9 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-# -- Lead-specific protocol handlers --
+# -- Lead 侧协议处理函数 --
 def handle_shutdown_request(teammate: str) -> str:
+    """Lead 发起关闭请求：创建 request_id，发送 shutdown_request 消息。"""
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
@@ -360,6 +381,7 @@ def handle_shutdown_request(teammate: str) -> str:
 
 
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    """Lead 审查计划：通过 request_id 找到对应计划，更新状态并回复。"""
     with _tracker_lock:
         req = plan_requests.get(request_id)
     if not req:
@@ -374,11 +396,12 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
 
 
 def _check_shutdown_status(request_id: str) -> str:
+    """查询某个关闭请求的当前状态。"""
     with _tracker_lock:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
-# -- Lead tool dispatch (12 tools) --
+# -- Lead 工具分发（12 个工具） --
 TOOL_HANDLERS = {
     "bash":              lambda **kw: _run_bash(kw["command"]),
     "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
@@ -394,7 +417,6 @@ TOOL_HANDLERS = {
     "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
 }
 
-# these base tools are unchanged from s02
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -424,6 +446,10 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """
+    Lead 的 Agent Loop（s10 增强版）。
+    每轮检查收件箱，包括处理队员发来的 plan_approval 请求。
+    """
     while True:
         inbox = BUS.read_inbox("lead")
         if inbox:
@@ -460,6 +486,7 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    """交互式 REPL，支持 /team 和 /inbox 命令。"""
     history = []
     while True:
         try:

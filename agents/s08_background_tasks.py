@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 # Harness: background execution -- the model thinks while the harness waits.
 """
-s08_background_tasks.py - Background Tasks
+s08_background_tasks.py - 后台任务（模型思考，后台等待）
 
-Run commands in background threads. A notification queue is drained
-before each LLM call to deliver results.
+在后台线程中运行长时间命令。通知队列在每次 LLM 调用前被排空，
+将完成结果注入对话上下文。
 
-    Main thread                Background thread
-    +-----------------+        +-----------------+
-    | agent loop      |        | task executes   |
-    | ...             |        | ...             |
-    | [LLM call] <---+------- | enqueue(result) |
-    |  ^drain queue   |        +-----------------+
+    主线程（Agent Loop）              后台线程（Task）
+    +-----------------+              +-----------------+
+    | agent loop      |              | task executes   |
+    | ...             |              | ...             |
+    | [LLM call] <---+------------  | enqueue(result) |
+    |  ^排空通知队列   |              +-----------------+
     +-----------------+
 
-    Timeline:
-    Agent ----[spawn A]----[spawn B]----[other work]----
+    时间线：
+    Agent ----[spawn A]----[spawn B]----[干其他工作]----
                  |              |
                  v              v
-              [A runs]      [B runs]        (parallel)
+              [A 执行]      [B 执行]          (并行运行)
                  |              |
-                 +-- notification queue --> [results injected]
+                 +-- 通知队列 --> [结果注入对话]
 
-Key insight: "Fire and forget -- the agent doesn't block while the command runs."
+核心理念: "Fire and forget -- the agent doesn't block while the command runs."
+          （启动后即可忘记——Agent 不会阻塞等待命令执行。）
+
+执行示例：
+    python agents/s08_background_tasks.py
+
+与 s07 的关系：
+    s07 让状态活到对话之外（文件持久化），s08 让时间活到对话之外（后台并行）。
+    两者结合实现了真正的异步工作流。
 """
 
 import os
@@ -46,15 +54,22 @@ MODEL = os.environ["MODEL_ID"]
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
 
-# -- BackgroundManager: threaded execution + notification queue --
+# -- BackgroundManager: 多线程执行 + 通知队列 --
 class BackgroundManager:
+    """
+    后台任务管理器。
+    通过 daemon 线程执行 shell 命令，主线程不会被阻塞。
+    完成结果通过通知队列（_notification_queue）传递，
+    主循环在每次 LLM 调用前排空队列后将结果注入消息中。
+    """
+
     def __init__(self):
-        self.tasks = {}  # task_id -> {status, result, command}
-        self._notification_queue = []  # completed task results
-        self._lock = threading.Lock()
+        self.tasks = {}                # task_id -> {status, result, command}
+        self._notification_queue = []  # 已完成任务的通知队列
+        self._lock = threading.Lock()  # 线程安全锁
 
     def run(self, command: str) -> str:
-        """Start a background thread, return task_id immediately."""
+        """启动一个后台线程，立即返回 task_id（fire and forget）。"""
         task_id = str(uuid.uuid4())[:8]
         self.tasks[task_id] = {"status": "running", "result": None, "command": command}
         thread = threading.Thread(
@@ -64,7 +79,7 @@ class BackgroundManager:
         return f"Background task {task_id} started: {command[:80]}"
 
     def _execute(self, task_id: str, command: str):
-        """Thread target: run subprocess, capture output, push to queue."""
+        """线程执行体：运行子进程，捕获输出，推入通知队列。"""
         try:
             r = subprocess.run(
                 command, shell=True, cwd=WORKDIR,
@@ -80,6 +95,7 @@ class BackgroundManager:
             status = "error"
         self.tasks[task_id]["status"] = status
         self.tasks[task_id]["result"] = output or "(no output)"
+        # 线程安全地将结果推入通知队列
         with self._lock:
             self._notification_queue.append({
                 "task_id": task_id,
@@ -89,7 +105,7 @@ class BackgroundManager:
             })
 
     def check(self, task_id: str = None) -> str:
-        """Check status of one task or list all."""
+        """查询单个任务状态或列出所有任务。"""
         if task_id:
             t = self.tasks.get(task_id)
             if not t:
@@ -101,7 +117,7 @@ class BackgroundManager:
         return "\n".join(lines) if lines else "No background tasks."
 
     def drain_notifications(self) -> list:
-        """Return and clear all pending completion notifications."""
+        """取出并清空所有待处理的通知（线程安全）。"""
         with self._lock:
             notifs = list(self._notification_queue)
             self._notification_queue.clear()
@@ -111,14 +127,16 @@ class BackgroundManager:
 BG = BackgroundManager()
 
 
-# -- Tool implementations --
+# -- 基础工具实现 --
 def safe_path(p: str) -> Path:
+    """安全检查：确保路径不逃逸工作目录。"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 def run_bash(command: str) -> str:
+    """同步执行 shell 命令（阻塞，最长 120 秒）。"""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -131,6 +149,7 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 def run_read(path: str, limit: int = None) -> str:
+    """读取文件内容，可选限制行数。"""
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -140,6 +159,7 @@ def run_read(path: str, limit: int = None) -> str:
         return f"Error: {e}"
 
 def run_write(path: str, content: str) -> str:
+    """写入文件（自动创建父目录）。"""
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -149,6 +169,7 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """在文件中替换指定文本。"""
     try:
         fp = safe_path(path)
         c = fp.read_text()
@@ -160,6 +181,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# -- 工具注册表：新增后台执行和状态查询工具 --
 TOOL_HANDLERS = {
     "bash":             lambda **kw: run_bash(kw["command"]),
     "read_file":        lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -186,8 +208,13 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """
+    Agent 核心循环。
+    s08 的关键变更：每次 LLM 调用前排空后台通知队列，
+    将已完成的后台任务结果注入消息列表，让模型立即看到。
+    """
     while True:
-        # Drain background notifications and inject as system message before LLM call
+        # 排空后台通知队列，将完成结果作为特殊消息注入
         notifs = BG.drain_notifications()
         if notifs and messages:
             notif_text = "\n".join(
@@ -216,6 +243,7 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    """交互式 REPL：支持后台执行命令。"""
     history = []
     while True:
         try:
